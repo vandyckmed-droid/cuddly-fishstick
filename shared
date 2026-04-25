@@ -1,799 +1,476 @@
-# book/shared.py
-# Math + factor model + portfolio construction.
-# Reads from cache via db.py. No fetching, no SQL beyond db.py loaders.
-# Run directly to compute factors on the test universe + run self-tests.
+# cache.py
+# Cache maintainer for the factor system.
+# Read & write SQLite. No factor math. No reporting. Single concern.
+#
+# Phase 1: 8-name test universe + SPY.
+# Modes: full / prices / financials / status.
 
 import os
-import numpy as np
+import json
+import time
+import gzip
+import shutil
+import sqlite3
+from datetime import datetime, timedelta
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
-import db
+from mysecrets import API_KEY
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(ROOT, "data")
+DB_PATH = os.path.join(DATA_DIR, "cache.db")
+BACKUP_PATH = os.path.join(DATA_DIR, "cache.db.bak")
+
+BASE = "https://financialmodelingprep.com/stable"
+REQUEST_SLEEP = 0.1
+TIMEOUT = 30
+
+# Refresh thresholds
+UNIVERSE_REFRESH_DAYS = 7
+FINANCIALS_REFRESH_DAYS = 21
+PRICES_STALE_DAYS = 1
+
+# History depth
+PRICE_LOOKBACK_DAYS = 1100
+
+# Phase 1 hardcoded test universe.
+# (ticker, sector_hint) — sector_hint is provisional, profile fetch overrides.
+UNIVERSE = [
+    ("AAPL",  "Technology"),
+    ("MSFT",  "Technology"),
+    ("NVDA",  "Technology"),
+    ("LULU",  "Consumer Cyclical"),
+    ("JPM",   "Financial Services"),
+    ("XOM",   "Energy"),
+    ("BRK.B", "Financial Services"),
+    ("KO",    "Consumer Defensive"),
+]
+MARKET_TICKER = "SPY"
+
+os.makedirs(DATA_DIR, exist_ok=True)
 
 
-# =========================================================================== #
-# Constants — all model knobs live here
-# =========================================================================== #
-
-# Standardization
-WINSOR_LO = 0.05
-WINSOR_HI = 0.95
-SECTOR_WEIGHT = 0.8
-GLOBAL_WEIGHT = 0.2
-
-# Residual momentum (long-window beta + recent measurement)
-BETA_WINDOW_DAYS = 504           # 2 years for beta estimation
-MEASUREMENT_WINDOW_DAYS = 252    # 1 year for residual measurement
-MOMENTUM_LONG_SKIP_DAYS = 21     # 12m-1m: drop most recent month
-MOMENTUM_SHORT_LB_DAYS = 126     # 6m window
-MIN_BETA_OBS = 60
-MIN_MEAS_OBS = 60
-
-# Risk model / portfolio construction
-EWMA_LAMBDA = 0.94
-TARGET_VOL_ANNUAL = 0.20
-TRADING_DAYS = 252
-W_EQ, W_IV, W_MV = 0.5, 0.25, 0.25
-CORR_SHRINK_DELTA = 0.10
-MIN_RETURN_OBS = 60
-SECTOR_CAP = 0.25
-SECTOR_CAP_MAX_ITER = 20
-
-TOP_N = 30
+# --------------------------------------------------------------------------- #
+# DB
+# --------------------------------------------------------------------------- #
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS universe("
+        "ticker TEXT PRIMARY KEY, sector TEXT, added_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS prices("
+        "ticker TEXT, date TEXT, close REAL, "
+        "PRIMARY KEY(ticker, date))"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS financials("
+        "ticker TEXT PRIMARY KEY, data TEXT, fetched_at TEXT)"
+    )
+    conn.commit()
+    return conn
 
 
-# =========================================================================== #
-# Math primitives
-# =========================================================================== #
-def _to_float(v):
-    if v is None:
-        return np.nan
+def meta_get(conn, key):
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def meta_set(conn, key, value):
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", (key, value)
+    )
+    conn.commit()
+
+
+def backup_db():
+    """Copy cache.db -> cache.db.bak before any write run."""
+    if os.path.exists(DB_PATH):
+        try:
+            shutil.copy2(DB_PATH, BACKUP_PATH)
+            print(f"  Backup written: {os.path.basename(BACKUP_PATH)}")
+        except Exception as e:
+            print(f"  Warning: backup failed: {e}")
+
+
+# --------------------------------------------------------------------------- #
+# FMP API (stdlib HTTP)
+# --------------------------------------------------------------------------- #
+def fmp_symbol(ticker):
+    """Translate ticker to FMP's expected symbol form.
+    BRK.B -> BRK-B, etc. Most US tickers pass through unchanged.
+    """
+    return ticker.replace(".", "-")
+
+
+def api_get(path, params=None):
+    p = dict(params or {})
+    p["apikey"] = API_KEY
+    url = f"{BASE}/{path}?{urlencode(p)}"
+    req = Request(
+        url,
+        headers={"Accept-Encoding": "gzip", "User-Agent": "book-cache/1.0"},
+    )
     try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return np.nan
-    return f if np.isfinite(f) else np.nan
-
-
-def safe_div(a, b):
-    a = np.asarray(a, dtype=float)
-    b = np.asarray(b, dtype=float)
-    out = np.full(a.shape, np.nan)
-    ok = np.isfinite(a) & np.isfinite(b) & (b != 0)
-    out[ok] = a[ok] / b[ok]
-    return out
-
-
-def winsorize(x, lower=WINSOR_LO, upper=WINSOR_HI):
-    x = np.asarray(x, dtype=float)
-    valid = x[np.isfinite(x)]
-    if valid.size == 0:
-        return x.copy()
-    lo = np.quantile(valid, lower)
-    hi = np.quantile(valid, upper)
-    out = x.copy()
-    mask = np.isfinite(out)
-    out[mask] = np.clip(out[mask], lo, hi)
-    return out
-
-
-def zscore(x):
-    x = np.asarray(x, dtype=float)
-    valid = x[np.isfinite(x)]
-    if valid.size == 0:
-        return np.full(x.shape, np.nan)
-    mean = valid.mean()
-    sd = valid.std(ddof=0)
-    if sd == 0 or not np.isfinite(sd):
-        return np.where(np.isfinite(x), 0.0, np.nan)
-    return (x - mean) / sd
-
-
-def z(x):
-    """Winsorize then z-score. Convenience wrapper."""
-    return zscore(winsorize(x))
-
-
-def _rank_desc(x):
-    """Integer rank by descending value. NaN for non-finite entries."""
-    rank = np.full(x.shape, np.nan)
-    finite = np.isfinite(x)
-    if finite.any():
-        idx_finite = np.where(finite)[0]
-        order = idx_finite[np.argsort(-x[idx_finite], kind="mergesort")]
-        rank[order] = np.arange(1, order.size + 1)
-    return rank
-
-
-# =========================================================================== #
-# Sector helpers
-# =========================================================================== #
-def sector_groups(sectors):
-    """Bucket stock indices by sector label."""
-    groups = {}
-    for i, s in enumerate(sectors):
-        key = s if s else "Unknown"
-        groups.setdefault(key, []).append(i)
-    groups = {k: np.array(v, dtype=int) for k, v in groups.items()}
-    n_per_stock = np.zeros(len(sectors), dtype=float)
-    for idx in groups.values():
-        n_per_stock[idx] = idx.size
-    return groups, n_per_stock
-
-
-def z_within_sector(x, groups, min_n=3):
-    """Per-sector winsorize + z-score. Sectors below min_n produce NaN."""
-    out = np.full(x.shape, np.nan)
-    for idx in groups.values():
-        sub = x[idx]
-        if np.isfinite(sub).sum() < min_n:
-            continue
-        out[idx] = zscore(winsorize(sub))
-    return out
-
-
-def sector_alpha(groups, n_per_stock):
-    """α_s = n_s / max_s' n_s'. Down-weights tiny sectors."""
-    if not groups:
-        return np.zeros_like(n_per_stock)
-    max_n = max(idx.size for idx in groups.values())
-    if max_n == 0:
-        return np.zeros_like(n_per_stock)
-    return n_per_stock / float(max_n)
-
-
-# =========================================================================== #
-# Residual momentum (corrected: long-window beta, alpha dropped)
-# =========================================================================== #
-def _aligned_log_returns_pair(stock_dates, stock_close, mkt_dates, mkt_close):
-    """Align stock and market on common dates, return (r_s, r_m, dates)."""
-    common = sorted(set(stock_dates.tolist()) & set(mkt_dates.tolist()))
-    if len(common) < 2:
-        return None, None, None
-    s_idx = {d: i for i, d in enumerate(stock_dates.tolist())}
-    m_idx = {d: i for i, d in enumerate(mkt_dates.tolist())}
-    s_aligned = np.asarray([stock_close[s_idx[d]] for d in common], dtype=float)
-    m_aligned = np.asarray([mkt_close[m_idx[d]] for d in common], dtype=float)
-    if np.any(s_aligned <= 0) or np.any(m_aligned <= 0):
-        return None, None, None
-    r_s = np.diff(np.log(s_aligned))
-    r_m = np.diff(np.log(m_aligned))
-    return r_s, r_m, np.asarray(common[1:])
-
-
-def _beta_no_intercept(r_s_est, r_m_est):
-    """Slope coefficient for r_s = β · r_m. No intercept (alpha dropped).
-
-    β = Σ(r_m · r_s) / Σ(r_m²)
-    """
-    sxx = float(np.sum(r_m_est ** 2))
-    if sxx <= 0:
+        with urlopen(req, timeout=TIMEOUT) as r:
+            raw = r.read()
+            if r.headers.get("Content-Encoding") == "gzip":
+                raw = gzip.decompress(raw)
+            time.sleep(REQUEST_SLEEP)
+            return json.loads(raw.decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, ValueError):
         return None
-    return float(np.sum(r_m_est * r_s_est) / sxx)
+    except Exception:
+        return None
 
 
-def compute_residual_tstat_momentum_one(
-    s_dates, s_close, m_dates, m_close,
-    beta_days=BETA_WINDOW_DAYS,
-    meas_days=MEASUREMENT_WINDOW_DAYS,
-    long_skip_days=MOMENTUM_LONG_SKIP_DAYS,
-    short_lb_days=MOMENTUM_SHORT_LB_DAYS,
-    min_beta_obs=MIN_BETA_OBS,
-    min_meas_obs=MIN_MEAS_OBS,
-):
-    """For one stock, compute residual t-stat momentum at two horizons.
+def _first(rec):
+    if isinstance(rec, list):
+        return rec[0] if rec else None
+    if isinstance(rec, dict):
+        return rec
+    return None
 
-    Returns (m_long, m_short, debug_dict).
 
-    Procedure:
-      1. Align stock and market daily returns on common dates.
-      2. Split into estimation window (older) and measurement window (recent).
-      3. Estimate beta on the estimation window (no intercept — alpha dropped).
-      4. Compute residuals on the measurement window: ε = r_stock - β·r_market.
-      5. m_long  = sum(residuals[12m-1m]) / std(residuals[12m-1m])
-         m_short = sum(residuals[6m])     / std(residuals[6m])
-    """
-    debug = {"reason": None}
-
-    r_s_full, r_m_full, dates = _aligned_log_returns_pair(
-        s_dates, s_close, m_dates, m_close
+# --------------------------------------------------------------------------- #
+# Universe
+# --------------------------------------------------------------------------- #
+def update_universe(conn):
+    """For Phase 1: write the hardcoded list into the universe table."""
+    now = datetime.utcnow().isoformat()
+    print(f"Universe: writing {len(UNIVERSE)} hardcoded tickers")
+    conn.execute("DELETE FROM universe")
+    conn.executemany(
+        "INSERT OR REPLACE INTO universe(ticker, sector, added_at) "
+        "VALUES(?,?,?)",
+        [(t, s, now) for (t, s) in UNIVERSE],
     )
-    if r_s_full is None:
-        debug["reason"] = "alignment failed"
-        return float("nan"), float("nan"), debug
-
-    T = r_s_full.size
-    debug["aligned_obs"] = T
-    if T < min_beta_obs + min_meas_obs:
-        debug["reason"] = (
-            f"insufficient data ({T} < {min_beta_obs + min_meas_obs})"
-        )
-        return float("nan"), float("nan"), debug
-
-    # Define windows. Measurement is the *most recent* meas_days observations.
-    # Estimation is the beta_days observations *immediately before* that.
-    meas_start = max(T - meas_days, 0)
-    est_end = meas_start
-    est_start = max(est_end - beta_days, 0)
-
-    r_s_est = r_s_full[est_start:est_end]
-    r_m_est = r_m_full[est_start:est_end]
-    r_s_meas = r_s_full[meas_start:T]
-    r_m_meas = r_m_full[meas_start:T]
-
-    debug["est_window"] = (int(est_start), int(est_end), int(r_s_est.size))
-    debug["meas_window"] = (int(meas_start), int(T), int(r_s_meas.size))
-
-    if r_s_est.size < min_beta_obs:
-        debug["reason"] = f"est window too small ({r_s_est.size})"
-        return float("nan"), float("nan"), debug
-    if r_s_meas.size < min_meas_obs:
-        debug["reason"] = f"meas window too small ({r_s_meas.size})"
-        return float("nan"), float("nan"), debug
-
-    beta = _beta_no_intercept(r_s_est, r_m_est)
-    if beta is None or not np.isfinite(beta):
-        debug["reason"] = "beta estimation failed"
-        return float("nan"), float("nan"), debug
-    debug["beta"] = beta
-
-    # Residuals on the measurement window using the older beta
-    eps = r_s_meas - beta * r_m_meas
-    debug["residual_sum"] = float(np.sum(eps))
-    debug["residual_std"] = float(np.std(eps, ddof=0))
-
-    M = eps.size
-
-    # 12m-1m window (most of meas window, dropping the very recent month)
-    long_end = max(M - long_skip_days, 0)
-    long_slc = eps[:long_end]
-    if long_slc.size >= min_meas_obs:
-        sd = float(np.std(long_slc, ddof=0))
-        m_long = float(np.sum(long_slc) / sd) if sd > 0 else float("nan")
-    else:
-        m_long = float("nan")
-    debug["m_long_n"] = int(long_slc.size)
-
-    # 6m window
-    short_start = max(M - short_lb_days, 0)
-    short_slc = eps[short_start:]
-    if short_slc.size >= min_meas_obs:
-        sd = float(np.std(short_slc, ddof=0))
-        m_short = float(np.sum(short_slc) / sd) if sd > 0 else float("nan")
-    else:
-        m_short = float("nan")
-    debug["m_short_n"] = int(short_slc.size)
-
-    return m_long, m_short, debug
+    meta_set(conn, "universe_updated", now)
+    conn.commit()
 
 
-def compute_residual_tstat_momentum(price_with_dates, mkt_dates, mkt_close,
-                                     tickers):
-    """Return (m_long, m_short) arrays aligned to tickers."""
-    n = len(tickers)
-    m_long = np.full(n, np.nan)
-    m_short = np.full(n, np.nan)
-    for i, t in enumerate(tickers):
-        item = price_with_dates.get(t)
-        if item is None:
-            continue
-        s_dates, s_close = item
-        if s_close.size < 2:
-            continue
-        ml, ms, _dbg = compute_residual_tstat_momentum_one(
-            s_dates, s_close, mkt_dates, mkt_close
-        )
-        m_long[i] = ml
-        m_short[i] = ms
-    return m_long, m_short
+def list_universe(conn, include_market=True):
+    rows = conn.execute(
+        "SELECT ticker FROM universe ORDER BY ticker"
+    ).fetchall()
+    tickers = [r[0] for r in rows]
+    if include_market and MARKET_TICKER not in tickers:
+        tickers = tickers + [MARKET_TICKER]
+    return tickers
 
 
-# =========================================================================== #
-# Factor model
-# =========================================================================== #
-def compute_factors(fins, price_with_dates, mkt_dates, mkt_close):
-    """Compute Value, Quality, Momentum, Composite for tickers in fins.
+# --------------------------------------------------------------------------- #
+# Prices
+# --------------------------------------------------------------------------- #
+def _existing_price_range(conn, ticker):
+    row = conn.execute(
+        "SELECT MIN(date), MAX(date), COUNT(*) FROM prices WHERE ticker=?",
+        (ticker,),
+    ).fetchone()
+    if not row or row[2] == 0:
+        return None, None, 0
+    return row[0], row[1], int(row[2])
 
-    fins: {ticker: extracted_fields_dict (from db.extract_fields)}
-    price_with_dates: {ticker: (dates, closes)}
-    mkt_dates, mkt_close: market series
 
-    Returns (tickers_sorted, data_dict).
-    """
-    tickers = sorted(fins.keys())
-    if not tickers:
-        return tickers, {}
-
-    def col(getter):
-        return np.array([_to_float(getter(t)) for t in tickers], dtype=float)
-
-    sectors = [fins[t].get("sector") or "Unknown" for t in tickers]
-    groups, n_per_stock = sector_groups(sectors)
-    alpha = sector_alpha(groups, n_per_stock)
-
-    # Raw fundamental columns
-    fcf = col(lambda t: fins[t].get("free_cash_flow"))
-    ev = col(lambda t: fins[t].get("enterprise_value"))
-    ebit = col(lambda t: fins[t].get("ebit"))
-    op_inc = col(lambda t: fins[t].get("operating_income"))
-    gp = col(lambda t: fins[t].get("gross_profit"))
-    rev = col(lambda t: fins[t].get("revenue"))
-    ta = col(lambda t: fins[t].get("total_assets"))
-    td = col(lambda t: fins[t].get("total_debt"))
-    cash = col(lambda t: fins[t].get("cash_and_equivalents"))
-    book = col(lambda t: fins[t].get("book_value"))
-    mcap = col(lambda t: fins[t].get("market_cap"))
-
-    nd = td - cash
-
-    # Value (4 components, equal-weighted z-scores)
-    z_ebit_ev = z(safe_div(ebit, ev))
-    z_fcf_ev = z(safe_div(fcf, ev))
-    z_bm = z(safe_div(book, mcap))
-    z_sales_ev = z(safe_div(rev, ev))
-    value_raw = (z_ebit_ev + z_fcf_ev + z_bm + z_sales_ev) / 4.0
-
-    # Quality (3 components)
-    z_gp_ta = z(safe_div(gp, ta))
-    z_op_margin = z(safe_div(op_inc, rev))
-    z_low_lev = z(-safe_div(nd, ta))   # negate so higher = better
-    quality_raw = (z_gp_ta + z_op_margin + z_low_lev) / 3.0
-
-    # Momentum (2 residual t-stat components)
-    m_long, m_short = compute_residual_tstat_momentum(
-        price_with_dates, mkt_dates, mkt_close, tickers
+def _fetch_price_range(ticker, start_iso, end_iso):
+    """Fetch closes for ticker in [start, end]. Returns list of (date, close)."""
+    fmp_t = fmp_symbol(ticker)
+    data = api_get(
+        "historical-price-eod/light",
+        {"symbol": fmp_t, "from": start_iso, "to": end_iso},
     )
-    z_m_long = z(m_long)
-    z_m_short = z(m_short)
-    momentum_raw = (z_m_long + z_m_short) / 2.0
-
-    # Sector / global blend per top-level factor
-    def blend(raw):
-        zp = z(raw)
-        zs = z_within_sector(raw, groups)
-        zs_safe = np.where(np.isfinite(zs), zs, 0.0)
-        return GLOBAL_WEIGHT * zp + alpha * SECTOR_WEIGHT * zs_safe
-
-    value = blend(value_raw)
-    quality = blend(quality_raw)
-    momentum = blend(momentum_raw)
-
-    # Composite: raw mean — no top-level winsorize/z (per spec)
-    composite = (value + quality + momentum) / 3.0
-
-    return tickers, {
-        "value": value,
-        "quality": quality,
-        "momentum": momentum,
-        "composite": composite,
-        "rank": _rank_desc(composite),
-        "rank_value": _rank_desc(value),
-        "rank_quality": _rank_desc(quality),
-        "rank_momentum": _rank_desc(momentum),
-        "sectors": sectors,
-        "alpha": alpha,
-        "sector_sizes": {k: int(v.size) for k, v in groups.items()},
-        "subs": {
-            "z_ebit_ev": z_ebit_ev, "z_fcf_ev": z_fcf_ev,
-            "z_bm": z_bm, "z_sales_ev": z_sales_ev,
-            "z_gp_ta": z_gp_ta, "z_op_margin": z_op_margin,
-            "z_low_lev": z_low_lev,
-            "z_m_long": z_m_long, "z_m_short": z_m_short,
-            "m_long_raw": m_long, "m_short_raw": m_short,
-        },
-    }
+    if not data:
+        return []
+    records = data if isinstance(data, list) else data.get("historical", [])
+    out = []
+    for h in records:
+        d = h.get("date")
+        c = h.get("price")
+        if c is None:
+            c = h.get("adjClose")
+        if c is None:
+            c = h.get("close")
+        if d and c is not None:
+            try:
+                out.append((d, float(c)))
+            except (TypeError, ValueError):
+                pass
+    return out
 
 
-# =========================================================================== #
-# Risk model + portfolio construction
-# =========================================================================== #
-def aligned_log_returns(price_with_dates, tickers, min_obs=MIN_RETURN_OBS):
-    series = {}
-    for t in tickers:
-        item = price_with_dates.get(t)
-        if item is None:
+def update_prices(conn):
+    """Bring every ticker's price history up to date AND back to lookback."""
+    today = datetime.utcnow().date()
+    target_start = (today - timedelta(days=PRICE_LOOKBACK_DAYS)).isoformat()
+    target_end = today.isoformat()
+
+    tickers = list_universe(conn, include_market=True)
+    print(f"Prices: target range {target_start} to {target_end}")
+    print(f"        {len(tickers)} tickers to check")
+
+    fetched_total = 0
+    skipped = 0
+
+    for i, t in enumerate(tickers, 1):
+        oldest, newest, count = _existing_price_range(conn, t)
+        ranges_to_fetch = []
+
+        if count == 0:
+            ranges_to_fetch.append((target_start, target_end))
+        else:
+            if oldest > target_start:
+                end_back = (
+                    datetime.fromisoformat(oldest).date() - timedelta(days=1)
+                ).isoformat()
+                ranges_to_fetch.append((target_start, end_back))
+            try:
+                newest_d = datetime.fromisoformat(newest).date()
+            except Exception:
+                newest_d = None
+            if newest_d and newest_d < today - timedelta(days=PRICES_STALE_DAYS):
+                start_fwd = (newest_d + timedelta(days=1)).isoformat()
+                ranges_to_fetch.append((start_fwd, target_end))
+
+        if not ranges_to_fetch:
+            skipped += 1
+            print(f"  [{i}/{len(tickers)}] {t}: up-to-date "
+                  f"({count} bars, {oldest} to {newest})")
             continue
-        ds, cs = item
-        if cs.size < 2:
-            continue
-        series[t] = (ds, cs)
 
-    if not series:
-        return [], np.array([]), np.zeros((0, 0))
+        new_rows = []
+        for s, e in ranges_to_fetch:
+            print(f"  [{i}/{len(tickers)}] {t}: fetch {s} → {e}")
+            rows = _fetch_price_range(t, s, e)
+            new_rows.extend((t, d, c) for (d, c) in rows)
 
-    common = None
-    for ds, _cs in series.values():
-        s = set(ds.tolist())
-        common = s if common is None else (common & s)
-    if not common:
-        return [], np.array([]), np.zeros((0, 0))
+        if new_rows:
+            conn.executemany(
+                "INSERT OR REPLACE INTO prices(ticker, date, close) "
+                "VALUES(?,?,?)",
+                new_rows,
+            )
+            conn.commit()
+            fetched_total += len(new_rows)
+            print(f"      {len(new_rows)} bars stored")
+        else:
+            print(f"      no data returned")
 
-    dates = np.array(sorted(common))
-    kept, cols = [], []
-    for t in tickers:
-        if t not in series:
-            continue
-        ds, cs = series[t]
-        idx = {d: i for i, d in enumerate(ds.tolist())}
-        aligned = np.array([cs[idx[d]] for d in dates], dtype=float)
-        if aligned.size < min_obs + 1 or np.any(aligned <= 0):
-            continue
-        r = np.diff(np.log(aligned))
-        kept.append(t)
-        cols.append(r)
-
-    if not kept:
-        return [], dates, np.zeros((0, 0))
-
-    R = np.column_stack(cols)
-    if R.shape[0] < min_obs:
-        return [], dates, R
-    return kept, dates[1:], R
+    meta_set(conn, "prices_updated", datetime.utcnow().isoformat())
+    print(f"Prices: {fetched_total} new bars, {skipped} tickers skipped")
 
 
-def ewma_cov(R, lam=EWMA_LAMBDA, init_window=30):
-    T, N = R.shape
-    if T < init_window + 1:
-        init_window = max(2, T // 2)
-    init = R[:init_window]
-    init_centered = init - init.mean(axis=0, keepdims=True)
-    Sigma = (init_centered.T @ init_centered) / max(init_window - 1, 1)
-    for t in range(init_window, T):
-        r = R[t].reshape(-1, 1)
-        Sigma = lam * Sigma + (1.0 - lam) * (r @ r.T)
-    Sigma = 0.5 * (Sigma + Sigma.T)
-    return Sigma
-
-
-def cov_to_corr(Sigma):
-    d = np.sqrt(np.clip(np.diag(Sigma), 1e-24, None))
-    P = Sigma / np.outer(d, d)
-    np.fill_diagonal(P, 1.0)
-    return P
-
-
-def shrink_corr(P, delta=CORR_SHRINK_DELTA):
-    N = P.shape[0]
-    return (1.0 - delta) * P + delta * np.eye(N)
-
-
-def _solve_min_var(Sigma):
-    N = Sigma.shape[0]
-    ones = np.ones(N)
+# --------------------------------------------------------------------------- #
+# Financials
+# --------------------------------------------------------------------------- #
+def _financials_age_days(conn, ticker):
+    row = conn.execute(
+        "SELECT fetched_at FROM financials WHERE ticker=?", (ticker,)
+    ).fetchone()
+    if not row:
+        return None
     try:
-        x = np.linalg.solve(Sigma, ones)
-    except np.linalg.LinAlgError:
-        x = np.linalg.pinv(Sigma) @ ones
-    s = ones @ x
-    if not np.isfinite(s) or s == 0:
-        return np.full(N, 1.0 / N)
-    return x / s
-
-
-def min_var_long_only(Sigma, max_iter=64):
-    N = Sigma.shape[0]
-    active = np.ones(N, dtype=bool)
-    for _ in range(max_iter):
-        idx = np.where(active)[0]
-        if idx.size == 0:
-            return np.full(N, 1.0 / N)
-        w_sub = _solve_min_var(Sigma[np.ix_(idx, idx)])
-        neg = w_sub < -1e-12
-        if not neg.any():
-            w = np.zeros(N)
-            w[idx] = np.clip(w_sub, 0.0, None)
-            s = w.sum()
-            return w / s if s > 0 else np.full(N, 1.0 / N)
-        active[idx[neg]] = False
-    w = np.zeros(N)
-    w[idx] = np.clip(w_sub, 0.0, None)
-    s = w.sum()
-    return w / s if s > 0 else np.full(N, 1.0 / N)
-
-
-def composite_weights(Sigma_daily, sigma_daily):
-    N = Sigma_daily.shape[0]
-    w_eq = np.full(N, 1.0 / N)
-    inv_vol = 1.0 / np.where(sigma_daily > 0, sigma_daily, np.nan)
-    s = np.nansum(inv_vol)
-    w_iv = np.where(np.isfinite(inv_vol), inv_vol, 0.0) / s if s > 0 else w_eq.copy()
-    P = shrink_corr(cov_to_corr(Sigma_daily))
-    d = np.sqrt(np.diag(Sigma_daily))
-    Sigma_shrunk = P * np.outer(d, d)
-    w_mv = min_var_long_only(Sigma_shrunk)
-    w_rel = W_EQ * w_eq + W_IV * w_iv + W_MV * w_mv
-    return w_eq, w_iv, w_mv, w_rel
-
-
-def apply_sector_cap(w, sectors, cap=SECTOR_CAP, max_iter=SECTOR_CAP_MAX_ITER):
-    """Iteratively cap any sector at `cap` of total weight, redistributing
-    proportionally to all OTHER sector weights."""
-    w = np.asarray(w, dtype=float).copy()
-    s = w.sum()
-    if not np.isfinite(s) or s <= 0:
-        return w, {"capped_sectors": [], "iters": 0}
-    w = w / s
-    capped_history = []
-
-    for it in range(max_iter):
-        sec_sums = {}
-        for i, sec in enumerate(sectors):
-            sec_sums[sec] = sec_sums.get(sec, 0.0) + float(w[i])
-        over = [(sec, sw) for sec, sw in sec_sums.items() if sw > cap + 1e-9]
-        if not over:
-            break
-        over.sort(key=lambda kv: -kv[1])
-        sec, sw = over[0]
-        capped_history.append((sec, sw))
-        excess = sw - cap
-
-        in_sec = np.array(
-            [i for i, s_i in enumerate(sectors) if s_i == sec], dtype=int
-        )
-        out_sec = np.array(
-            [i for i, s_i in enumerate(sectors) if s_i != sec], dtype=int
-        )
-        if in_sec.size == 0:
-            break
-        scale = cap / sw
-        w[in_sec] = w[in_sec] * scale
-        out_total = float(w[out_sec].sum()) if out_sec.size else 0.0
-        if out_total > 1e-12 and out_sec.size:
-            w[out_sec] = w[out_sec] + (w[out_sec] / out_total) * excess
-        ws = w.sum()
-        if ws > 0:
-            w = w / ws
-
-    return w, {
-        "capped_sectors": [s for s, _ in capped_history],
-        "iters": len(capped_history),
-    }
-
-
-def vol_scale(w_rel, Sigma_daily, target=TARGET_VOL_ANNUAL,
-              days=TRADING_DAYS):
-    var_annual = float(w_rel @ (days * Sigma_daily) @ w_rel)
-    if not np.isfinite(var_annual) or var_annual <= 0:
-        return w_rel.copy(), float("nan"), float("nan")
-    sigma_p = np.sqrt(var_annual)
-    scale = target / sigma_p
-    return scale * w_rel, sigma_p, scale
-
-
-def build_book(price_with_dates, tickers, data, sectors_map, n=TOP_N):
-    """Build the vol-targeted top-n portfolio with sector cap applied."""
-    comp = data["composite"]
-    finite_idx = [i for i in range(len(tickers)) if np.isfinite(comp[i])]
-    finite_idx.sort(key=lambda i: -comp[i])
-    top_tix = [tickers[i] for i in finite_idx[:n]]
-    if len(top_tix) < 2:
+        fetched = datetime.fromisoformat(row[0])
+        return (datetime.utcnow() - fetched).days
+    except Exception:
         return None
 
-    pwd = {t: price_with_dates[t] for t in top_tix if t in price_with_dates}
-    kept, _dates, R = aligned_log_returns(pwd, top_tix, MIN_RETURN_OBS)
-    if len(kept) < 2 or R.size == 0:
-        return None
 
-    Sigma = ewma_cov(R, lam=EWMA_LAMBDA)
-    sigma_daily = np.sqrt(np.clip(np.diag(Sigma), 0.0, None))
-    sigma_ann = sigma_daily * np.sqrt(TRADING_DAYS)
+def update_financials(conn):
+    """Refresh quarterly fundamentals for any ticker whose record is older
+    than FINANCIALS_REFRESH_DAYS."""
+    tickers = list_universe(conn, include_market=False)
+    print(f"Financials: checking {len(tickers)} tickers")
 
-    w_eq, w_iv, w_mv, w_rel = composite_weights(Sigma, sigma_daily)
+    fetched = skipped = 0
 
-    sectors_kept = [sectors_map.get(t, "Unknown") for t in kept]
-    w_rel_capped, cap_info = apply_sector_cap(w_rel, sectors_kept,
-                                              cap=SECTOR_CAP)
-    w_final, sigma_p, scale = vol_scale(w_rel_capped, Sigma)
-
-    return {
-        "kept": kept,
-        "w_eq": w_eq, "w_iv": w_iv, "w_mv": w_mv,
-        "w_rel": w_rel_capped, "w_final": w_final,
-        "sigma_ann": sigma_ann, "sigma_p": sigma_p, "scale": scale,
-        "cap_info": cap_info,
-    }
-
-
-# =========================================================================== #
-# Self-tests
-# =========================================================================== #
-def _fmt_z(x):
-    if x is None or not np.isfinite(x):
-        return "—"
-    return f"{x:+.2f}"
-
-
-def _fmt_pct(x, dp=1):
-    if x is None or not np.isfinite(x):
-        return "—"
-    return f"{x * 100:.{dp}f}%"
-
-
-def run_self_tests():
-    print("=" * 72)
-    print("  shared.py self-tests")
-    print("=" * 72)
-
-    if not db.cache_exists():
-        print("  FAIL: cache.db does not exist. Run cache.py first.")
-        return False
-
-    conn = db.open_cache(read_only=True)
-    failures = 0
-
-    # Load everything from cache
-    universe = db.load_universe(conn, include_market=False)
-    fin_records = db.load_all_financials(conn)
-    fins = {t: db.extract_fields(fin_records.get(t)) for t in universe
-            if fin_records.get(t)}
-    price_with_dates = db.load_prices_bulk_with_dates(
-        conn, universe + [db.MARKET_TICKER]
-    )
-    mkt_dates, mkt_close = db.load_market(conn)
-    sectors_map = db.load_universe_with_sectors(conn)
-
-    print(f"  Loaded: {len(universe)} tickers, "
-          f"{len(fins)} financials, "
-          f"{len(price_with_dates)} price series\n")
-
-    # Compute factors
-    tix, data = compute_factors(fins, price_with_dates, mkt_dates, mkt_close)
-    print(f"  Factor model produced {len(tix)} tickers\n")
-
-    # Print full table
-    print("  FACTOR TABLE")
-    print("  " + "-" * 68)
-    print(f"  {'Ticker':<7}{'Sector':<22}"
-          f"{'Value':>9}{'Quality':>10}{'Mom':>8}{'Comp':>8}{'Rank':>6}")
-    print("  " + "-" * 68)
-    rank_order = sorted(
-        range(len(tix)),
-        key=lambda i: (
-            -data["composite"][i] if np.isfinite(data["composite"][i])
-            else float("inf")
-        ),
-    )
-    for i in rank_order:
-        t = tix[i]
-        sec = (data["sectors"][i] or "")[:20]
-        print(
-            f"  {t:<7}{sec:<22}"
-            f"{_fmt_z(data['value'][i]):>9}"
-            f"{_fmt_z(data['quality'][i]):>10}"
-            f"{_fmt_z(data['momentum'][i]):>8}"
-            f"{_fmt_z(data['composite'][i]):>8}"
-            f"{int(data['rank'][i]) if np.isfinite(data['rank'][i]) else '—':>6}"
-        )
-    print("  " + "-" * 68)
-
-    # Residual momentum diagnostics for all tickers
-    print("\n  RESIDUAL MOMENTUM — all tickers")
-    print("  " + "-" * 68)
-    print(f"  {'Ticker':<7}{'β':>8}{'res sum':>10}{'res std':>10}"
-          f"{'m_long':>10}{'m_short':>10}")
-    print("  " + "-" * 68)
-    for t in sorted(price_with_dates.keys()):
-        if t == db.MARKET_TICKER:
+    for i, t in enumerate(tickers, 1):
+        age = _financials_age_days(conn, t)
+        if age is not None and age <= FINANCIALS_REFRESH_DAYS:
+            skipped += 1
+            print(f"  [{i}/{len(tickers)}] {t}: fresh ({age}d)")
             continue
-        s_dates, s_close = price_with_dates[t]
-        ml, ms, dbg = compute_residual_tstat_momentum_one(
-            s_dates, s_close, mkt_dates, mkt_close
+
+        fmp_t = fmp_symbol(t)
+        print(f"  [{i}/{len(tickers)}] {t}: fetch (FMP symbol: {fmp_t})")
+
+        inc = api_get("income-statement",
+                      {"symbol": fmp_t, "period": "quarter", "limit": 1})
+        bal = api_get("balance-sheet-statement",
+                      {"symbol": fmp_t, "period": "quarter", "limit": 1})
+        cfs = api_get("cash-flow-statement",
+                      {"symbol": fmp_t, "period": "quarter", "limit": 1})
+        ev = api_get("enterprise-values",
+                     {"symbol": fmp_t, "period": "quarter", "limit": 1})
+        prof = api_get("profile", {"symbol": fmp_t})
+
+        record = {
+            "income": _first(inc),
+            "balance": _first(bal),
+            "cashflow": _first(cfs),
+            "enterprise": _first(ev),
+            "profile": _first(prof),
+        }
+
+        if all(record[k] is None for k in record):
+            print(f"      no data returned, skipping")
+            continue
+
+        conn.execute(
+            "INSERT OR REPLACE INTO financials(ticker, data, fetched_at) "
+            "VALUES(?,?,?)",
+            (t, json.dumps(record), datetime.utcnow().isoformat()),
         )
-        beta = dbg.get("beta")
-        rsum = dbg.get("residual_sum")
-        rstd = dbg.get("residual_std")
-        beta_s = f"{beta:+.2f}" if beta is not None and np.isfinite(beta) else "—"
-        rsum_s = f"{rsum:+.3f}" if rsum is not None and np.isfinite(rsum) else "—"
-        rstd_s = f"{rstd:.4f}" if rstd is not None and np.isfinite(rstd) else "—"
-        ml_s = f"{ml:+.2f}" if np.isfinite(ml) else "—"
-        ms_s = f"{ms:+.2f}" if np.isfinite(ms) else "—"
-        print(f"  {t:<7}{beta_s:>8}{rsum_s:>10}{rstd_s:>10}"
-              f"{ml_s:>10}{ms_s:>10}")
-    print("  " + "-" * 68)
+        prof_sec = (record.get("profile") or {}).get("sector")
+        if prof_sec:
+            conn.execute(
+                "UPDATE universe SET sector=? WHERE ticker=?",
+                (prof_sec, t),
+            )
+        conn.commit()
+        fetched += 1
 
-    # ----- TESTS -----
-    print("\n  TESTS")
-    print("  " + "-" * 68)
+    meta_set(conn, "financials_updated", datetime.utcnow().isoformat())
+    print(f"Financials: fetched={fetched} skipped={skipped}")
 
-    # T1: All 8 tickers produce a finite composite
-    finite_n = int(np.isfinite(data["composite"]).sum())
-    if finite_n == 8:
-        print(f"  ✓ all 8 tickers have finite composite ({finite_n}/8)")
+
+# --------------------------------------------------------------------------- #
+# Status report
+# --------------------------------------------------------------------------- #
+def print_status(conn):
+    """Read-only report on cache state. iPhone-readable."""
+    print("\n" + "=" * 56)
+    print("  CACHE STATUS")
+    print("=" * 56)
+
+    if os.path.exists(DB_PATH):
+        size_kb = os.path.getsize(DB_PATH) / 1024.0
+        print(f"  DB file:        {DB_PATH}")
+        print(f"  Size:           {size_kb:.1f} KB")
     else:
-        failures += 1
-        print(f"  ✗ composite finite count: {finite_n}/8 (expected 8)")
+        print(f"  DB file:        does not exist yet")
+        return
 
-    # T2: LULU residual momentum is negative
-    lulu_idx = tix.index("LULU") if "LULU" in tix else None
-    if lulu_idx is not None:
-        lulu_m_long = data["subs"]["m_long_raw"][lulu_idx]
-        lulu_m_short = data["subs"]["m_short_raw"][lulu_idx]
-        if lulu_m_long < 0 and lulu_m_short < 0:
-            print(f"  ✓ LULU residual momentum is negative "
-                  f"(m_long={lulu_m_long:+.2f}, m_short={lulu_m_short:+.2f})")
+    print(f"  Universe upd:   {meta_get(conn, 'universe_updated') or '—'}")
+    print(f"  Prices upd:     {meta_get(conn, 'prices_updated') or '—'}")
+    print(f"  Financials upd: {meta_get(conn, 'financials_updated') or '—'}")
+
+    today = datetime.utcnow().date()
+    target_start = (today - timedelta(days=PRICE_LOOKBACK_DAYS)).isoformat()
+
+    rows = conn.execute(
+        "SELECT ticker, sector FROM universe ORDER BY ticker"
+    ).fetchall()
+    universe_tix = [r[0] for r in rows]
+
+    print(f"\n  Universe ({len(universe_tix)}):")
+    print(f"    {'Ticker':<8}{'Sector':<22}{'Bars':>6}{'Oldest':>13}"
+          f"{'Newest':>13}  {'Fin':>7}")
+    print("    " + "-" * 70)
+
+    all_tickers = universe_tix + ([MARKET_TICKER] if MARKET_TICKER not in
+                                   universe_tix else [])
+    for t in all_tickers:
+        if t == MARKET_TICKER:
+            sec = "(market)"
         else:
-            failures += 1
-            print(f"  ✗ LULU residual momentum should be negative "
-                  f"(m_long={lulu_m_long:+.2f}, m_short={lulu_m_short:+.2f})")
-    else:
-        failures += 1
-        print(f"  ✗ LULU not found in factor output")
+            sec_row = conn.execute(
+                "SELECT sector FROM universe WHERE ticker=?", (t,)
+            ).fetchone()
+            sec = (sec_row[0] if sec_row and sec_row[0] else "—")[:20]
 
-    # T3: Sector counts match expectation
-    expected_sectors = {
-        "Technology": 3,
-        "Financial Services": 2,
-        "Consumer Cyclical": 1,
-        "Consumer Defensive": 1,
-        "Energy": 1,
-    }
-    actual = data["sector_sizes"]
-    sector_ok = all(actual.get(k, 0) == v for k, v in expected_sectors.items())
-    if sector_ok and len(actual) == len(expected_sectors):
-        print(f"  ✓ sector groups correct: {actual}")
-    else:
-        failures += 1
-        print(f"  ✗ sector groups: got {actual}, expected {expected_sectors}")
-
-    # T4: Build book — should produce a valid portfolio
-    book = build_book(price_with_dates, tix, data, sectors_map, n=TOP_N)
-    if book is None:
-        failures += 1
-        print(f"  ✗ build_book returned None")
-    else:
-        w_rel = book["w_rel"]
-        sigma_p = book["sigma_p"]
-        scale = book["scale"]
-
-        # Weights sum to ~1 (relative book)
-        w_rel_sum = float(w_rel.sum())
-        if abs(w_rel_sum - 1.0) < 1e-6:
-            print(f"  ✓ w_rel sums to 1.0 ({w_rel_sum:.6f})")
+        oldest, newest, count = _existing_price_range(conn, t)
+        if count == 0:
+            bars_str = "0"
+            oldest_str = "—"
+            newest_str = "—"
         else:
-            failures += 1
-            print(f"  ✗ w_rel sum: {w_rel_sum} (expected 1.0)")
+            bars_str = str(count)
+            oldest_str = oldest or "—"
+            newest_str = newest or "—"
+            try:
+                newest_d = datetime.fromisoformat(newest).date()
+                if (today - newest_d).days > 5:
+                    newest_str += "!"
+            except Exception:
+                pass
+            if oldest and oldest > target_start:
+                oldest_str += "!"
 
-        # No sector exceeds cap (allow 0.5% slack — proportional rebalancer
-        # converges asymptotically when 2 large sectors trade weight)
-        sec_sums = {}
-        for j, t in enumerate(book["kept"]):
-            s = sectors_map.get(t, "Unknown")
-            sec_sums[s] = sec_sums.get(s, 0.0) + float(w_rel[j])
-        max_sec = max(sec_sums.values()) if sec_sums else 0.0
-        cap_tolerance = 0.005
-        if max_sec <= SECTOR_CAP + cap_tolerance:
-            print(f"  ✓ sector cap holds (max sector = {max_sec*100:.2f}%, "
-                  f"cap = {SECTOR_CAP*100:.0f}% + {cap_tolerance*100:.1f}% tol)")
+        age = _financials_age_days(conn, t)
+        if t == MARKET_TICKER:
+            fin_str = "n/a"
+        elif age is None:
+            fin_str = "—"
         else:
-            failures += 1
-            print(f"  ✗ sector cap violated: max = {max_sec*100:.2f}% "
-                  f"(cap = {SECTOR_CAP*100:.0f}%, tol = {cap_tolerance*100:.1f}%)")
+            fin_str = f"{age}d"
+            if age > FINANCIALS_REFRESH_DAYS:
+                fin_str += "!"
 
-        # Vol scale finite
-        if np.isfinite(sigma_p) and np.isfinite(scale):
-            print(f"  ✓ portfolio vol = {sigma_p*100:.1f}% (annual), "
-                  f"scale = {scale:.2f}×")
+        print(f"    {t:<8}{sec:<22}{bars_str:>6}"
+              f"{oldest_str:>13}{newest_str:>13}  {fin_str:>7}")
+
+    print(f"\n  Target lookback: {target_start} ({PRICE_LOOKBACK_DAYS}d)")
+    print(f"  '!' = stale or insufficient")
+    print("=" * 56)
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def main():
+    print("=" * 56)
+    print("  cache.py — cache maintainer")
+    print("=" * 56)
+    print("  [1] Full   (universe + prices + financials)")
+    print("  [2] Prices only")
+    print("  [3] Financials only")
+    print("  [4] Status (no fetching)")
+    print("  [enter] = full")
+    print("=" * 56)
+
+    try:
+        choice = input("Mode: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+
+    conn = get_conn()
+    try:
+        if choice in ("", "1", "full"):
+            backup_db()
+            update_universe(conn)
+            update_prices(conn)
+            update_financials(conn)
+            print()
+            print_status(conn)
+        elif choice in ("2", "prices"):
+            backup_db()
+            if not list_universe(conn, include_market=False):
+                update_universe(conn)
+            update_prices(conn)
+            print()
+            print_status(conn)
+        elif choice in ("3", "financials", "fundamentals"):
+            backup_db()
+            if not list_universe(conn, include_market=False):
+                update_universe(conn)
+            update_financials(conn)
+            print()
+            print_status(conn)
+        elif choice in ("4", "status"):
+            print_status(conn)
         else:
-            failures += 1
-            print(f"  ✗ vol/scale not finite (sigma_p={sigma_p}, "
-                  f"scale={scale})")
-
-        # cap_info
-        ci = book["cap_info"]
-        if ci["capped_sectors"]:
-            print(f"  ℹ sector cap engaged on: {ci['capped_sectors']} "
-                  f"({ci['iters']} iter)")
-        else:
-            print(f"  ℹ no sectors hit cap")
-
-    conn.close()
-
-    print("=" * 72)
-    if failures == 0:
-        print(f"  ALL TESTS PASSED")
-    else:
-        print(f"  {failures} TEST(S) FAILED")
-    print("=" * 72)
-    return failures == 0
+            print(f"Unknown mode: '{choice}'")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
-    run_self_tests()
+    main()
