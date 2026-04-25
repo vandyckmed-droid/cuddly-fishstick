@@ -1,0 +1,17 @@
+# Secrets — never commit
+mysecrets.py
+
+# Cache and data — generated, not source
+data/
+*.db
+*.db-wal
+*.db-shm
+*.db.bak
+
+# Reports — generated
+reports/
+
+# Pythonista / Python artifacts
+__pycache__/
+*.pyc
+.DS_Store
